@@ -33,6 +33,8 @@ parser.add_argument('--lr_scheduler_type', type=str, default='linear', help='lr 
 parser.add_argument('--warmup_ratio', type=float, default=0.1, help='warmup ratio')
 
 parser.add_argument('--debug', default=False, action="store_true")
+parser.add_argument('--precision', type=str, default='bf16', choices=['bf16', 'fp16'], help='训练精度')
+add_lora_args(parser)
 args = parser.parse_args()
 
 # uniform format
@@ -40,6 +42,8 @@ if args.noise_rate in [0, 0.0]:
     args.noise_rate = 0
 if args.para in [0, 0.0]:
     args.para = 0
+
+validate_unbiased_para(args.loss, args.para)
 
 gpu_nums = torch.cuda.device_count()
 print(gpu_nums)
@@ -51,11 +55,12 @@ model_name = return_model_name(args.model)
 sft_model_path = f"./models/sft_{args.model}_{args.dataset}"
 if not os.path.exists(sft_model_path):
     raise ValueError('No exist sft model, train sft model first')
+dtype, precision_kwargs = resolve_precision(args)
 reward_model = AutoModelForSequenceClassification.from_pretrained(
     sft_model_path,
     num_labels=1,  # Reward model outputs a single score
     trust_remote_code=True,
-    dtype=torch.bfloat16
+    dtype=dtype
     # device_map=device_map
 )
 tokenizer = AutoTokenizer.from_pretrained(sft_model_path, trust_remote_code=True)
@@ -83,14 +88,18 @@ elif args.dataset == 'ufb':
 
 
 # wandb
+# entity / project 优先读环境变量 WANDB_ENTITY / WANDB_PROJECT；
+# 不设 WANDB_ENTITY 时用 wandb 登录账号的默认 entity。
 if int(os.environ.get("RANK", "0")) == 0:
     wandb.init(
-        entity="your name",
-        project="your name",
-
+        entity=os.environ.get("WANDB_ENTITY", None),
+        project=os.environ.get("WANDB_PROJECT", "unbiased-alignment"),
     )
 
 # config
+# 奖励模型的 score head 是新加的模块，LoRA 模式下必须放进 modules_to_save 才会被训练
+peft_config = build_lora_config(args, modules_to_save=["score"] if args.use_lora else None)
+
 reward_args = RewardConfig(
     per_device_train_batch_size=per_device_train_batch_size,
     per_device_eval_batch_size=per_device_train_batch_size,
@@ -102,7 +111,6 @@ reward_args = RewardConfig(
     eval_strategy="steps",
     eval_steps=20,
     save_strategy="no",
-    bf16=True,
     report_to="wandb",
     max_grad_norm=args.max_grad_norm,
     seed=args.seed,
@@ -110,7 +118,8 @@ reward_args = RewardConfig(
     warmup_ratio=args.warmup_ratio,
     max_length=args.max_length,
     gradient_checkpointing=True,
-    loss_type=args.loss
+    loss_type=args.loss,
+    **precision_kwargs,
 )
 if args.loss == 'sigmoid':
     reward_args.label_smoothing = args.para
@@ -119,7 +128,7 @@ elif args.loss == 'robust':
 elif args.loss == 'unbiased':
     reward_args.unbiased_a = args.para
 elif args.loss == 'normal_unbiased':
-    reward_args.unbiased_a = args.para    
+    reward_args.unbiased_a = args.para
 
 reward_trainer = RewardTrainer(
     model=reward_model,
@@ -127,17 +136,25 @@ reward_trainer = RewardTrainer(
     train_dataset=preference_train_dataset,
     eval_dataset=preference_test_dataset,
     args=reward_args,
+    peft_config=peft_config,
 )
 
 if int(os.environ.get("RANK", "0")) == 0:
     print('--- Training data example ---')
     print('--- chosen response ---\n' + tokenizer.decode(reward_trainer.train_dataset[0]['chosen_input_ids']))
     print('--- rejected response ---\n' + tokenizer.decode(reward_trainer.train_dataset[0]['rejected_input_ids']))
+    if peft_config is not None:
+        print(f'--- LoRA enabled: r={peft_config.r} alpha={peft_config.lora_alpha} '
+              f'targets={peft_config.target_modules} modules_to_save={peft_config.modules_to_save} ---')
 
 # train and save
 reward_trainer.train()
 reward_model_path = f"./models/reward_{args.model}_{args.dataset}_{args.loss}_para={args.para}_noise={args.noise_rate}"
-reward_trainer.save_model(reward_model_path)
+if peft_config is not None:
+    # 合并 adapter 后再存，保证产物是一个完整可加载的奖励模型
+    save_merged_model(reward_trainer, reward_model_path, tokenizer)
+else:
+    reward_trainer.save_model(reward_model_path)
 
 if int(os.environ.get("RANK", "0")) == 0:
     print("reward model train end")
